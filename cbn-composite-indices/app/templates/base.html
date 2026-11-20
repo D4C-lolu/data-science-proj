@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="A workspace for computing and exploring CBN composite indices.">
+    <title>{% block title %}CBN Composite Indices{% endblock %}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  </head>
+  <body class="min-h-screen bg-slate-50 text-slate-900 antialiased">
+    <header class="border-b border-slate-200 bg-white">
+      <div class="mx-auto flex max-w-7xl items-center justify-between px-6 py-4">
+        <a href="{{ url_for('index') if current_user.is_authenticated else url_for('auth.login') }}" class="text-lg font-semibold tracking-tight">CBN Composite Indices</a>
+        {% if current_user.is_authenticated %}
+        <nav class="hidden items-center gap-6 text-sm font-medium text-slate-600 md:flex">
+          <a href="{{ url_for('indices.landing') }}" class="hover:text-slate-900">Indices</a>
+          <a href="{{ url_for('indices.upload_form') }}" class="hover:text-slate-900">New run</a>
+          <a href="{{ url_for('indices.runs') }}" class="hover:text-slate-900">Runs</a>
+        </nav>
+        {% endif %}
+        <div class="flex items-center gap-4">
+          {% if current_user.is_authenticated %}
+            <span class="hidden text-sm text-slate-500 sm:inline">{{ current_user.username }}</span>
+            <form method="post" action="{{ url_for('auth.sign_out') }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <button type="submit" class="text-sm font-medium text-slate-600 hover:text-slate-900">Sign out</button>
+            </form>
+          {% else %}
+            <span class="text-sm text-slate-500">Analysis workspace</span>
+          {% endif %}
+        </div>
+      </div>
+    </header>
+    <main class="mx-auto max-w-7xl px-6 py-10">
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          <div class="mb-6 space-y-3" aria-live="polite">
+            {% for category, message in messages %}
+              <div class="rounded-xl border px-4 py-3 text-sm {{ 'border-emerald-200 bg-emerald-50 text-emerald-800' if category == 'success' else 'border-blue-200 bg-blue-50 text-blue-800' }}">{{ message }}</div>
+            {% endfor %}
+          </div>
+        {% endif %}
+      {% endwith %}
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>

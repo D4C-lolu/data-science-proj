@@ -1,0 +1,285 @@
+"""
+HFCI weighting: Equal, PCA-only, FA-only and Hybrid PCA-FA on the full 18-indicator / 5-pillar household set.
+Run on your laptop:  python hfci_all_methods.py
+ - Step 0 simulates a household survey (4 rounds x 2,500 households, with survey weights) and SAVES it to your
+   laptop (DATA_PATH). Replace that file with real IHFCS household indicators (same column names H1..H18,
+   plus 'round' and 'w') and the rest of the script runs unchanged.
+ - Output: one Excel workbook (OUTPUT_XLSX) with one sheet per result block.
+Requires: numpy, pandas, openpyxl  (scipy optional, only for the Bartlett p-value)
+"""
+import numpy as np                                   # numerical arrays and linear algebra
+import pandas as pd                                  # tables (DataFrames) and Excel output
+from pathlib import Path                             # portable file paths for your laptop
+from openpyxl.styles import Font                     # used to bold the Excel header rows
+
+# ----------------------------------------------------------------------------- 0. SETTINGS
+BASE_DIR = Path(r"C:\Users\Olanrewaju Sanni\Downloads")      # your folder (edit if needed)
+if not BASE_DIR.exists(): BASE_DIR = Path.cwd()               # if that folder is missing (e.g. another PC), use the current folder
+DATA_PATH   = BASE_DIR / "hfci_simulated_dataset.csv"         # household dataset on your laptop
+OUTPUT_XLSX = BASE_DIR / "HFCI_weighting_results.xlsx"        # results workbook created by this script
+SEED, N_HH, N_ROUNDS = 11, 2500, 4                   # random seed, households per round, number of survey rounds
+N_BOOT, N_PA = 100, 100                              # bootstrap resamples; parallel-analysis simulations
+
+# ----------------------------------------------------------------------------- 1. HELPER FUNCTIONS (survey-weighted)
+def wmean(X, w):                                     # survey-weighted column means
+    return (X * w[:, None]).sum(0) / w.sum()         # sum(weight x value) / sum(weights)
+
+def wstd(X, w):                                      # survey-weighted standard deviations
+    m = wmean(X, w)                                  # weighted means
+    return np.sqrt((((X - m) ** 2) * w[:, None]).sum(0) / (w.sum() - 1))   # weighted variance, then square root
+
+def wcorr(Z, w):                                     # survey-weighted correlation matrix of standardised data
+    C = (Z * w[:, None]).T @ Z / w.sum()             # weighted covariance of z-scores
+    d = np.sqrt(np.diag(C))                          # weighted standard deviations (close to 1)
+    return C / np.outer(d, d)                        # scale to correlations
+
+def varimax(L, it=200, tol=1e-9):                    # varimax rotation of a loading matrix L (p indicators x k factors)
+    p, k = L.shape; R = np.eye(k); d = 0             # p = indicators, k = factors, R = rotation matrix, d = previous criterion
+    for _ in range(it):                              # iterate until the criterion stops improving
+        Lr = L @ R                                   # current rotated loadings
+        u, s, vt = np.linalg.svd(L.T @ (Lr**3 - Lr @ np.diag((Lr**2).sum(0)) / p))   # SVD of the varimax gradient
+        R = u @ vt; dn = s.sum()                     # update the rotation; dn = new value of the criterion
+        if dn < d * (1 + tol): break                 # stop when the improvement is negligible
+        d = dn                                       # remember the criterion for the next pass
+    return L @ R                                     # return the rotated loadings
+
+def fix_sign(L):                                     # make each factor's loadings mostly positive (sign is arbitrary)
+    return L * np.where(L.sum(0) < 0, -1, 1)         # flip any column whose loadings sum to a negative number
+
+def assign_weights(L, cols):                         # shared by FA-only and Hybrid: loadings -> weights
+    assign = np.abs(L).argmax(1)                     # assign each indicator to the factor with its largest |loading|
+    ss = (L ** 2).sum(0); fw = ss / ss.sum()         # sum of squared loadings per factor; fw = factor weights
+    wi = np.zeros(L.shape[0])                        # container for indicator weights
+    for f in range(L.shape[1]):                      # loop over factors
+        m = assign == f                              # indicators assigned to factor f
+        if m.any(): wi[m] = (L[m, f] ** 2) / (L[m, f] ** 2).sum() * fw[f]   # within-factor share x factor weight
+    return pd.Series(wi / wi.sum(), index=cols)      # normalise so weights sum to 1
+
+def paf(R, k, it=500, tol=1e-6):                     # principal-axis factoring (common-factor model)
+    h = 1 - 1 / np.diag(np.linalg.inv(R))            # starting communalities: squared multiple correlations
+    for _ in range(it):                              # iterate communalities until they converge
+        Rr = R.copy(); np.fill_diagonal(Rr, h)       # reduced correlation matrix: communalities on the diagonal
+        w, v = np.linalg.eigh(Rr); o = np.argsort(w)[::-1][:k]            # keep the k largest eigenvalues
+        L = v[:, o] * np.sqrt(np.clip(w[o], 0, None))                     # factor loadings (negative eigenvalues set to 0)
+        hn = np.clip((L ** 2).sum(1), 0, 0.995)      # new communalities, capped to avoid Heywood cases
+        if np.max(np.abs(hn - h)) < tol: h = hn; break                    # converged: stop
+        h = hn                                       # otherwise carry the new communalities forward
+    return L, h                                      # loadings and communalities
+
+def parallel_threshold(p, n_eff, reps=N_PA, seed=3):  # Horn's parallel analysis: eigenvalues expected from pure noise
+    rng = np.random.default_rng(seed)                # reproducible random generator
+    sims = np.array([np.sort(np.linalg.eigvalsh(np.corrcoef(rng.normal(size=(int(n_eff), p)).T)))[::-1] for _ in range(reps)])  # random-data eigenvalues
+    return np.percentile(sims, 95, axis=0)           # 95th percentile threshold for each component
+
+def eig_sorted(R):                                   # eigen-decomposition of a correlation matrix, largest first
+    w, v = np.linalg.eigh(R); o = np.argsort(w)[::-1]
+    return w[o], v[:, o]
+
+def weights_from_corr(R, method, k=None, cols=None):  # weights for any method from a (weighted) correlation matrix
+    p = R.shape[0]; cols = cols if cols is not None else list(range(p))   # number of indicators and labels
+    w_, v_ = eig_sorted(R)                           # eigenvalues and eigenvectors
+    k = k or int((w_ > 1).sum())                     # number of factors: Kaiser rule unless supplied
+    if method == 'equal':                            # METHOD 1: equal weights
+        return pd.Series(np.ones(p) / p, index=cols)
+    if method == 'pca':                              # METHOD 2: PCA only
+        L = fix_sign(v_[:, :k] * np.sqrt(w_[:k]))    # unrotated loadings = eigenvector x sqrt(eigenvalue)
+        share = w_[:k] / w_[:k].sum()                # each component's share of the retained variance
+        raw = (L ** 2 * share).sum(1)                # squared loadings weighted by variance share, summed over components
+        return pd.Series(raw / raw.sum(), index=cols)    # normalise to sum 1
+    if method == 'fa':                               # METHOD 3: factor analysis only
+        L, h = paf(R, k)                             # principal-axis factoring
+        L = fix_sign(varimax(L)) if k > 1 else fix_sign(L)   # rotate only if more than one factor
+        return assign_weights(L, cols)               # loadings -> weights
+    if method == 'hybrid':                           # METHOD 4: hybrid PCA-FA
+        L = fix_sign(varimax(v_[:, :k] * np.sqrt(w_[:k])))   # PCA loadings, then varimax rotation
+        return assign_weights(L, cols)               # within- and between-factor weights
+
+# ----------------------------------------------------------------------------- 2. INDICATOR SET (5 pillars, 18 indicators)
+META = {  # id: (name, pillar, polarity)  polarity +1 = higher is better, -1 = higher is worse
+ 'H1':('Real household income growth','1 Income and income stability',1),'H2':('Households reporting income decline','1 Income and income stability',-1),
+ 'H3':('Irregular or volatile income','1 Income and income stability',-1),'H4':('Multiple income sources','1 Income and income stability',1),
+ 'H5':('Real consumption growth','2 Consumption',1),'H6':('Food share of consumption','2 Consumption',-1),'H7':('Households cutting consumption','2 Consumption',-1),
+ 'H8':('Debt-to-income ratio','3 Debt burden',-1),'H9':('Debt-service-to-income ratio','3 Debt burden',-1),
+ 'H10':('Missed or late repayments (arrears)','3 Debt burden',-1),'H11':('Borrowing to meet basic needs','3 Debt burden',-1),
+ 'H12':('Savings rate','4 Savings and liquidity',1),'H13':('Emergency buffer of 3+ months','4 Savings and liquidity',1),
+ 'H14':('Unable to raise emergency funds','4 Savings and liquidity',-1),
+ 'H15':('Difficulty making ends meet','5 Vulnerability and access',-1),'H16':('Access to formal financial services','5 Vulnerability and access',1),
+ 'H17':('Denied or discouraged from credit','5 Vulnerability and access',-1),'H18':('Expected financial situation (12 months)','5 Vulnerability and access',1)}
+COLS = list(META)                                                     # indicator IDs in order
+POL  = {c: META[c][2] for c in COLS}                                  # polarity dictionary
+PILLARS = {}                                                          # pillar -> list of indicator IDs
+for c in COLS: PILLARS.setdefault(META[c][1], []).append(c)          # group indicators by pillar
+
+# ----------------------------------------------------------------------------- 3. SIMULATE AND SAVE THE DATASET ("on your laptop")
+def simulate_households(seed=SEED, N=N_HH, R_=N_ROUNDS):   # builds household microdata from five hidden household factors
+    rng = np.random.default_rng(seed)                # reproducible randomness
+    Cf = np.array([[1,.4,.3,.35,.4],[.4,1,.2,.3,.35],[.3,.2,1,.3,.3],[.35,.3,.3,1,.4],[.4,.35,.3,.4,1]])   # correlation between hidden factors
+    Lc = np.linalg.cholesky(Cf)                      # used to create correlated factors
+    Lam = {'H1':[.8,.1,0,0,.1],'H2':[.75,.15,0,0,.15],'H3':[.7,.1,.05,.1,.1],'H4':[.6,0,0,.25,.2],     # true loadings of each indicator on the hidden factors
+           'H5':[.2,.75,0,.1,.1],'H6':[.15,.7,.05,.05,.2],'H7':[.2,.7,.05,.1,.15],
+           'H8':[0,.05,.8,.1,.1],'H9':[0,.1,.85,.05,.1],'H10':[.05,.1,.7,.1,.2],'H11':[.1,.15,.6,.1,.25],
+           'H12':[.15,.1,.05,.8,.1],'H13':[.1,.05,.05,.8,.1],'H14':[.1,.1,.1,.7,.2],
+           'H15':[.25,.2,.2,.15,.65],'H16':[.1,.05,.05,.2,.6],'H17':[.05,.05,.25,.1,.65],'H18':[.2,.15,.1,.15,.55]}
+    shift = np.array([0.0, -0.25, -0.45, -0.15])     # change in average conditions by round: deterioration, then partial recovery
+    frames = []                                      # one DataFrame per round
+    for r in range(R_):                              # loop over survey rounds
+        Fh = rng.normal(size=(N, 5)) @ Lc.T + shift[r]   # household factors for this round
+        d = {}                                       # indicator columns
+        for c in COLS:                               # build each indicator
+            better = Fh @ np.array(Lam[c]) + rng.normal(0, rng.uniform(.5, .75), N)   # indicator in the "better" direction plus noise
+            d[c] = POL[c] * better                   # record as a survey would (negative indicators: higher = worse)
+        df = pd.DataFrame(d); df['round'] = r + 1    # add the round number
+        df['w'] = np.exp(rng.normal(0, .5, N)); df['w'] *= N / df['w'].sum()   # survey weights scaled to sum to N per round
+        frames.append(df)
+    out = pd.concat(frames, ignore_index=True)       # stack the four rounds
+    out.insert(0, 'hh_id', range(1, len(out) + 1))   # household identifier
+    return out
+
+if not DATA_PATH.exists():                           # create the dataset only if it is not already on the laptop
+    simulate_households().to_csv(DATA_PATH, index=False)   # save it (replace this file with real IHFCS data later)
+data = pd.read_csv(DATA_PATH)                        # LOAD the household dataset from the laptop
+rounds = data['round'].values                        # survey round of each household
+w = data['w'].values.astype(float)                   # survey (design) weights
+raw = data[COLS].copy()                              # the 18 indicators as recorded
+
+# ----------------------------------------------------------------------------- 4. COMMON PREPARATION (identical for all four methods)
+miss_before = int(raw.isna().sum().sum())            # (a) count missing values
+raw = raw.fillna(raw.groupby(rounds).transform('median'))   # (a) impute any gaps with the round median
+miss_after = int(raw.isna().sum().sum())             # missing values left after imputation
+X = raw.values * np.array([POL[c] for c in COLS])    # (b) polarity alignment: higher = better financial conditions
+Z = (X - wmean(X, w)) / wstd(X, w)                   # (c) survey-weighted z-scores against the pooled baseline
+Z = np.clip(Z, -3, 3)                                # (d) winsorise at +/-3 standard deviations
+Z = (Z - wmean(Z, w)) / wstd(Z, w)                   # (e) re-standardise after capping
+n, p = Z.shape                                       # n = households, p = indicators
+n_eff = w.sum() ** 2 / (w ** 2).sum()                # effective sample size after survey weighting
+R = wcorr(Z, w)                                      # (f) survey-weighted correlation matrix used by every factor method
+Ri = np.linalg.inv(R)                                # inverse of R (needed for partial correlations)
+A = -Ri / np.sqrt(np.outer(np.diag(Ri), np.diag(Ri))); np.fill_diagonal(A, 0)   # (g) partial (anti-image) correlations
+Ro = R - np.eye(p)                                   # off-diagonal parts of R
+msa = (Ro**2).sum(0) / ((Ro**2).sum(0) + (A**2).sum(0))      # (g) MSA for each indicator
+kmo = (Ro**2).sum() / ((Ro**2).sum() + (A**2).sum())         # (g) overall KMO
+chi2 = -(n_eff - 1 - (2*p + 5) / 6) * np.log(np.linalg.det(R)); dof = p*(p-1)//2   # (h) Bartlett chi-square and df (uses effective n)
+try:
+    from scipy.stats import chi2 as _c; pval = float(_c.sf(chi2, dof))   # p-value if scipy is installed
+except Exception:
+    pval = np.nan                                    # otherwise leave blank
+def cronbach(cs):                                    # (i) reliability of a pillar (survey-weighted)
+    idx = [COLS.index(c) for c in cs]; k = len(cs)   # positions of the pillar's indicators
+    S = Z[:, idx]; var_sum = (wstd(S, w) ** 2).sum() # sum of the indicator variances
+    tot_var = wstd(S.sum(1, keepdims=True), w)[0] ** 2   # variance of the pillar total
+    return k / (k - 1) * (1 - var_sum / tot_var)     # Cronbach's alpha formula
+alpha = {pl: cronbach(cs) for pl, cs in PILLARS.items()}     # alpha for each pillar
+w_eig, v_eig = eig_sorted(R)                         # (j) eigenvalues and eigenvectors of R
+thr = parallel_threshold(p, n_eff)                   # (j) parallel-analysis thresholds
+k_kaiser = int((w_eig > 1).sum()); k_pa = int((w_eig > thr).sum())   # (j) number of factors: Kaiser vs parallel analysis
+
+# ----------------------------------------------------------------------------- 5. THE FOUR METHODS
+w_eq  = weights_from_corr(R, 'equal', cols=COLS)     # Method 1a: equal weights, single level
+P_ = len(PILLARS)                                    # number of pillars
+w_eq2 = pd.Series({c: 1 / P_ / len(cs) for cs in PILLARS.values() for c in cs})[COLS]   # Method 1b: equal weights, two level
+w_pca = weights_from_corr(R, 'pca', k_kaiser, COLS)  # Method 2: PCA only
+w_fa  = weights_from_corr(R, 'fa', k_pa, COLS)       # Method 3: factor analysis only (k by parallel analysis)
+w_fa4 = weights_from_corr(R, 'fa', k_kaiser, COLS)   # Method 3b: factor analysis with k = Kaiser number
+w_hyb = weights_from_corr(R, 'hybrid', k_kaiser, COLS)   # Method 4: hybrid PCA-FA
+W = pd.DataFrame({'Equal (single level)': w_eq, 'Equal (two level)': w_eq2, 'PCA only': w_pca,
+                  f'FA only (k={k_pa})': w_fa, f'FA only (k={k_kaiser})': w_fa4, 'Hybrid PCA-FA': w_hyb})   # all weights side by side
+
+L_pca = fix_sign(v_eig[:, :k_kaiser] * np.sqrt(w_eig[:k_kaiser]))               # unrotated PCA loadings
+L_fa, h_fa = paf(R, k_pa); L_fa = fix_sign(varimax(L_fa)) if k_pa > 1 else fix_sign(L_fa)   # FA loadings and communalities
+L_fa4, h_fa4 = paf(R, k_kaiser); L_fa4 = fix_sign(varimax(L_fa4)) if k_kaiser > 1 else fix_sign(L_fa4)   # FA with k = Kaiser
+L_hyb = fix_sign(varimax(v_eig[:, :k_kaiser] * np.sqrt(w_eig[:k_kaiser])))      # hybrid rotated loadings
+asg = np.abs(L_hyb).argmax(1); ss_h = (L_hyb**2).sum(0); fw_h = ss_h / ss_h.sum()   # hybrid assignment and factor weights
+within = pd.Series([L_hyb[i, asg[i]]**2 / (L_hyb[asg == asg[i], asg[i]]**2).sum() for i in range(p)], index=COLS)   # within-factor weight
+
+# ----------------------------------------------------------------------------- 6. HOUSEHOLD SCORES, NATIONAL INDEX AND COMPARISON
+S = pd.DataFrame({m: Z @ W[m].values for m in W.columns})       # household composite score under each weight set
+S = S / S.apply(lambda s: np.sqrt(np.average((s - np.average(s, weights=w))**2, weights=w)))   # rescale to household sd = 1
+base = {m: np.average(S[m], weights=w) for m in S.columns}      # pooled baseline mean of each score
+nat = pd.DataFrame({m: [100 + 10 * (np.average(S[m][rounds == r], weights=w[rounds == r]) - base[m]) for r in np.unique(rounds)]
+                    for m in S.columns}, index=[f'Round {r}' for r in np.unique(rounds)])   # national HFCI by round (baseline = 100)
+stress = pd.DataFrame({m: [100 * np.average((S[m][rounds == r] < -1).astype(float), weights=w[rounds == r]) for r in np.unique(rounds)]
+                       for m in S.columns}, index=nat.index)    # stress share: % of households more than 1 sd below the baseline
+score_corr = S.corr()                                           # correlation of household scores between methods
+pillar_tot = pd.DataFrame({m: {pl: W.loc[cs, m].sum() for pl, cs in PILLARS.items()} for m in W.columns})   # weight per pillar
+
+def corr_weights(Zs, ws, method, k):                 # re-estimate weights on a (re)sampled dataset
+    Zs = (Zs - wmean(Zs, ws)) / wstd(Zs, ws)         # re-standardise the sample
+    return weights_from_corr(wcorr(Zs, ws), method, k, COLS).values   # weights from its weighted correlation matrix
+rb = np.random.default_rng(5); boot = {'PCA only': [], 'FA only': [], 'Hybrid PCA-FA': []}   # bootstrap containers
+for _ in range(N_BOOT):                              # resample households with replacement
+    ii = rb.integers(0, n, n)                        # random household indices
+    boot['PCA only'].append(corr_weights(Z[ii], w[ii], 'pca', k_kaiser))
+    boot['FA only'].append(corr_weights(Z[ii], w[ii], 'fa', k_pa))
+    boot['Hybrid PCA-FA'].append(corr_weights(Z[ii], w[ii], 'hybrid', k_kaiser))
+boot_sd = pd.DataFrame({m: np.std(np.array(a), 0) for m, a in boot.items()}, index=COLS)   # SD of each weight across resamples
+perm = np.random.default_rng(9).permutation(n); halves = [perm[:n//2], perm[n//2:]]          # two random half-samples
+half_w = {m: [corr_weights(Z[h], w[h], mm, kk) for h in halves] for m, mm, kk in [('PCA only','pca',k_kaiser),('FA only','fa',k_pa),('Hybrid PCA-FA','hybrid',k_kaiser)]}
+inc = Z[:, [COLS.index(c) for c in PILLARS['1 Income and income stability']]].mean(1)       # income-stability score of each household
+lo = inc < np.average(inc, weights=w)                # households with below-average income stability
+sub_w = {m: [corr_weights(Z[g], w[g], mm, kk) for g in (lo, ~lo)] for m, mm, kk in [('PCA only','pca',k_kaiser),('FA only','fa',k_pa),('Hybrid PCA-FA','hybrid',k_kaiser)]}
+stab = pd.DataFrame({'Test': ['Mean bootstrap SD of weights (pp)','Max bootstrap SD of any weight (pp)','Max difference between random halves (pp)',
+                              'Max difference lower vs higher income-stability households (pp)']})
+for m in ['PCA only', 'FA only', 'Hybrid PCA-FA']:   # fill the stability table for each estimated method
+    stab[m] = [100*boot_sd[m].mean(), 100*boot_sd[m].max(), 100*np.abs(half_w[m][0]-half_w[m][1]).max(), 100*np.abs(sub_w[m][0]-sub_w[m][1]).max()]
+stab.iloc[:, 1:] = stab.iloc[:, 1:].astype(float).round(2)
+
+# ----------------------------------------------------------------------------- 7. BUILD THE RESULT SHEETS
+sheets = {}                                          # sheet name -> DataFrame (each sheet lists its full result)
+names = [k for k in ['README','Indicators','Raw_Data','Prep_Z_Scores','Prep_Tests','Prep_Indicator_MSA','Correlation_Matrix','Eigenvalues','M1_Equal',
+         'M2_PCA_Only','M3_FA_Only','M3b_FA_Kaiser_k','M4_Hybrid','Weights_All','Pillar_Totals','Household_Scores','National_Index','Stress_Share',
+         'Method_Comparison','Weight_Stability','Decision_Summary']]
+desc = ['Guide to the sheets','18 indicators, pillar, polarity','Household dataset loaded from your laptop (as recorded)','Polarity-aligned, winsorised, survey-weighted z-scores (common to all methods)',
+ 'KMO, Bartlett test, Cronbach alpha per pillar, factor-count rules','Measure of sampling adequacy per indicator','Survey-weighted correlation matrix','Eigenvalues, variance explained, parallel-analysis thresholds',
+ 'Equal weights (single and two level)','PCA loadings and weights','FA loadings, communalities and weights (k by parallel analysis)','FA with k = Kaiser rule (sensitivity)',
+ 'Hybrid rotated loadings, assignment, within/factor/final weights','All weights side by side','Weight per pillar under each method','Household composite scores under each method',
+ 'National HFCI by survey round under each method','Stress share (% of households >1 sd below baseline) by round','Correlation of household scores between methods',
+ 'Bootstrap, split-half and subgroup stability of weights','Automatic reading of the results']
+sheets['README'] = pd.DataFrame({'Sheet': names[1:], 'Content': desc[1:]})
+sheets['Indicators'] = pd.DataFrame([(c, META[c][0], META[c][1], '+' if POL[c] > 0 else '-') for c in COLS], columns=['ID','Indicator','Pillar','Polarity'])
+sheets['Raw_Data'] = data
+sheets['Prep_Z_Scores'] = pd.concat([data[['hh_id','round','w']].reset_index(drop=True), pd.DataFrame(Z, columns=COLS).round(4)], axis=1)
+sheets['Prep_Tests'] = pd.DataFrame({'Test': ['Households (n)','Effective sample size','Indicators (p)','Observations per indicator','Missing values before imputation','Missing values after imputation',
+    'KMO overall','Bartlett chi-square (effective n)','Bartlett df','Bartlett p-value','Factors: Kaiser rule (eigenvalue>1)','Factors: parallel analysis','Variance explained by Kaiser factors']+[f'Cronbach alpha {k}' for k in alpha],
+  'Value': [n, round(n_eff), p, round(n/p), miss_before, miss_after, round(kmo,3), round(chi2,1), dof, pval, k_kaiser, k_pa, round(w_eig[:k_kaiser].sum()/p,3)]+[round(v,3) for v in alpha.values()]})
+sheets['Prep_Indicator_MSA'] = pd.DataFrame({'ID': COLS, 'Indicator': [META[c][0] for c in COLS], 'MSA': msa.round(3)})
+sheets['Correlation_Matrix'] = pd.DataFrame(R, index=COLS, columns=COLS).round(3).reset_index().rename(columns={'index':'ID'})
+sheets['Eigenvalues'] = pd.DataFrame({'Component': range(1, p+1), 'Eigenvalue': w_eig.round(3), '% variance': (w_eig/p*100).round(1), 'Cumulative %': (np.cumsum(w_eig)/p*100).round(1),
+    'Parallel threshold': thr.round(3), 'Kaiser (>1)': w_eig > 1, 'Passes parallel': w_eig > thr})
+base_cols = {'ID': COLS, 'Indicator': [META[c][0] for c in COLS], 'Pillar': [META[c][1] for c in COLS]}
+sheets['M1_Equal'] = pd.DataFrame({**base_cols, 'Weight single level': w_eq.values, 'Weight two level': w_eq2.values})
+sheets['M2_PCA_Only'] = pd.DataFrame({'ID': COLS, 'Indicator': base_cols['Indicator'], **{f'PC{j+1} loading': L_pca[:, j].round(3) for j in range(k_kaiser)}, 'PCA weight': w_pca.values})
+sheets['M3_FA_Only'] = pd.DataFrame({'ID': COLS, 'Indicator': base_cols['Indicator'], **{f'F{j+1} loading': np.atleast_2d(L_fa.T)[j].round(3) for j in range(k_pa)},
+    'Communality': h_fa.round(3), 'Flag (<0.20)': h_fa < 0.20, 'FA weight': w_fa.values})
+sheets['M3b_FA_Kaiser_k'] = pd.DataFrame({'ID': COLS, 'Indicator': base_cols['Indicator'], **{f'F{j+1} loading': np.atleast_2d(L_fa4.T)[j].round(3) for j in range(k_kaiser)},
+    'Communality': h_fa4.round(3), 'FA weight': w_fa4.values})
+sheets['M4_Hybrid'] = pd.DataFrame({'ID': COLS, 'Indicator': base_cols['Indicator'], **{f'F{j+1} rotated loading': L_hyb[:, j].round(3) for j in range(k_kaiser)},
+    'Assigned factor': [f'F{a+1}' for a in asg], 'Cross-loading >0.4 on another factor': [bool((np.abs(L_hyb[i]) > 0.4).sum() > 1) for i in range(p)],
+    'Within-factor weight': within.values, 'Factor weight': [fw_h[a] for a in asg], 'Final weight': w_hyb.values})
+wa = W.reset_index().rename(columns={'index':'ID'}); wa.insert(1, 'Indicator', base_cols['Indicator'])
+sheets['Weights_All'] = pd.concat([wa, pd.DataFrame([['Total', '', *W.sum().values]], columns=wa.columns)], ignore_index=True)
+sheets['Pillar_Totals'] = pillar_tot.reset_index().rename(columns={'index':'Pillar'})
+sheets['Household_Scores'] = pd.concat([data[['hh_id','round','w']].reset_index(drop=True), S.round(4)], axis=1)
+sheets['National_Index'] = nat.round(2).reset_index().rename(columns={'index':'Round'})
+sheets['Stress_Share'] = stress.round(1).reset_index().rename(columns={'index':'Round'})
+sheets['Method_Comparison'] = score_corr.round(4).reset_index().rename(columns={'index':'Correlation of household scores'})
+sheets['Weight_Stability'] = stab
+min_corr = score_corr.loc['Equal (two level)'].drop('Equal (two level)').min()      # lowest agreement with two-level equal weights
+low_h = [c for c, h_ in zip(COLS, h_fa) if h_ < 0.20]                                  # indicators with communality below 0.20
+cross = [COLS[i] for i in range(p) if (np.abs(L_hyb[i]) > 0.4).sum() > 1]              # indicators loading above 0.4 on two or more factors
+sheets['Decision_Summary'] = pd.DataFrame({'Item': ['KMO reading','Bartlett test','Number of factors','Lowest correlation of household scores with two-level equal weights',
+    'Largest national-index gap between methods (index points)','Largest stress-share gap between methods (pp)','Indicators with FA communality below 0.20','Cross-loading indicators (hybrid)','Suggested weighting','Reminder'],
+  'Result': [f'{kmo:.3f} ({"adequate" if kmo >= 0.6 else "inadequate"})', 'significant' if (not np.isnan(pval) and pval < 0.05) else f'chi-square {chi2:.0f}, df {dof}',
+    f'Kaiser = {k_kaiser}, parallel analysis = {k_pa}: report both', f'{min_corr:.3f}', f'{(nat.max(axis=1) - nat.min(axis=1)).max():.2f}', f'{(stress.max(axis=1) - stress.min(axis=1)).max():.2f}',
+    ', '.join(low_h) if low_h else 'none', ', '.join(cross) if cross else 'none',
+    'Two-level equal weights for the headline (indices agree closely); publish statistical weights and stress shares as robustness checks' if min_corr >= 0.98 else 'Hybrid PCA-FA weights with guard-rails (scores differ materially)',
+    'Freeze the weights; re-estimate only at an agreed review. Replace the simulated file by real IHFCS data before using the results.']})
+
+# ----------------------------------------------------------------------------- 8. WRITE THE EXCEL WORKBOOK
+with pd.ExcelWriter(OUTPUT_XLSX, engine='openpyxl') as xw:       # open the workbook for writing
+    for name in names:                                           # one sheet per result block
+        df_ = sheets[name]; df_.to_excel(xw, sheet_name=name[:31], index=False)   # Excel limits sheet names to 31 characters
+        ws = xw.sheets[name[:31]]; ws.freeze_panes = 'A2'        # keep the header row visible
+        for cell in ws[1]: cell.font = Font(bold=True)           # bold header
+        for col in ws.columns:                                   # set a readable column width
+            ws.column_dimensions[col[0].column_letter].width = min(48, max(10, max(len(str(c.value)) if c.value is not None else 0 for c in col[:60]) + 2))
+print(f'Done: {OUTPUT_XLSX} written with {len(sheets)} sheets; dataset at {DATA_PATH}')

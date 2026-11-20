@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+
+{% block title %}Runs · CBN Composite Indices{% endblock %}
+
+{% block content %}
+<section class="flex flex-wrap items-end justify-between gap-4">
+  <div>
+    <p class="text-sm font-semibold uppercase tracking-widest text-blue-700">Runs</p>
+    <h1 class="mt-2 text-3xl font-semibold tracking-tight">Index runs</h1>
+    <p class="mt-2 leading-7 text-slate-600">This view refreshes automatically while a run is queued or processing.</p>
+  </div>
+  <a href="{{ url_for('indices.upload_form') }}" class="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700">New run</a>
+</section>
+
+<div id="runs-container"
+     class="mt-8"
+     hx-get="{{ url_for('indices.runs_fragment') }}"
+     hx-trigger="load, every 3s [document.body.dataset.polling !== 'off']"
+     hx-swap="innerHTML">
+  <p class="text-sm text-slate-500">Loading runs…</p>
+</div>
+
+<script>
+  document.body.dataset.polling = "on";
+  document.body.addEventListener("keep-polling", () => { document.body.dataset.polling = "on"; });
+  document.body.addEventListener("stop-polling", () => { document.body.dataset.polling = "off"; });
+</script>
+{% endblock %}
