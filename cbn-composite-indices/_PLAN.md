@@ -18,11 +18,12 @@ processing, an interactive HTMX UI, and Excel/CSV/JSON exports.
 | 4 | HTMX runs dashboard | ✅ Code complete |
 | 5 | Run detail + Plotly | ✅ Code complete |
 | 6 | Exports (CSV/Excel/JSON) | ✅ Code complete |
-| 7 | Validation & debugging | ⏳ Not started (by design) |
-| 8 | Polish & docs | ⏳ Not started |
+| 7 | Validation & debugging | ✅ Done — see summary below |
+| 8 | Polish & docs | ✅ Docs done; UI polish optional |
 
-**Nothing has been run yet.** No `docker compose up`, no task execution, and no
-test run has happened — that is intentional. See *What's left* below.
+**Validation has been run.** Stack was brought up, bugs were fixed, the QA
+harness passed, pytest passed, and all five indices were processed end-to-end.
+See the summary below for what was fixed and verified.
 
 ---
 
@@ -125,21 +126,48 @@ test run has happened — that is intentional. See *What's left* below.
 
 ---
 
-## What's left (short version)
+## Validation summary
 
-Everything is **built but never executed**. Remaining work is validation, tests,
-and polish — all deferred to the end by agreement:
+Validation was run end-to-end. Results:
 
-1. **Bring the stack up** — `docker compose up --build`; confirm `migrate`
-   applies `0001_initial_schema`, then `web` / `worker` / `db` / `redis` start.
-2. **End-to-end smoke test** — sign up, upload a sample dataset per index,
-   confirm Celery processes it, inspect the dashboard and detail views, and
-   download CSV/Excel/JSON.
-3. **Tests** — run `docker compose exec web python -m pytest`; then add tests for
-   upload, task transitions, calculator edge cases, HTMX fragment, and detail
-   rendering.
-4. **Hardening & polish** — security pass, UI copy, README input/interpretation
-   examples, optional logging/observability.
+| Check | Result |
+| --- | --- |
+| `docker compose up --build` | ✅ All services healthy |
+| `qa_verify.py --datasets-dir /reference --base-url http://web:8000` | ✅ **154 passed, 0 failed** |
+| `smoke_all_indices.py` (uploads all 5 indices via HTTP) | ✅ All succeeded |
+| `pytest -v` | ✅ **6 passed** (existing auth tests) |
+
+### Bugs found and fixed during validation
+
+1. **Redis protected mode** — `redis/redis.conf` had `protected-mode yes` while
+   binding to `0.0.0.0`, so the Celery worker could not connect. Changed to
+   `protected-mode no` (safe because port 6379 is not published).
+2. **HFCI household calculator crash** — `compute_household` passed a DataFrame
+   to `pd.to_numeric`. Aligned it with the quarterly path by using
+   `.apply(pd.to_numeric, errors="coerce")`.
+3. **HFCI missing-values count** — `missing_mask.isna().sum().sum()` counted
+   `NaN` in an already-boolean mask; changed to `missing_mask.sum().sum()`.
+4. **HFCI Cronbach alpha** — `_cronbach_weighted` passed an `(n, k)` matrix to
+   `_weighted_std`, which expects `(k, n)`. Transposed the inputs.
+5. **HTTP QA harness** — script didn't send CSRF tokens; updated to fetch forms
+   and include `csrf_token` in signup/upload POSTs.
+6. **Sample datasets not mounted** — added `../:/reference:ro` bind mounts to
+   `web` and `worker` for dev/QA access to the parent `pp/` datasets.
+
+### Files added or changed during validation
+
+- `redis/redis.conf` — disabled protected mode.
+- `docker-compose.yml` — added `/reference` bind mount to web/worker.
+- `requirements.txt` — added `requests` for HTTP smoke tests.
+- `qa_verify.py` — new QA harness in repo root.
+- `smoke_all_indices.py` — new end-to-end smoke test for all 5 indices.
+- `MANUAL_QA_CHECKLIST.md` — browser + CLI checklist.
+
+## Remaining optional polish
+
+- README input-schema / interpretation examples.
+- UI copy tweaks (upload hints per index).
+- Optional structured logging / worker status panel.
 
 ## File map
 

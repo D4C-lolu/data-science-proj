@@ -10,12 +10,19 @@ login_manager.login_message_category = "info"
 
 
 class FlaskContextTask(Task):
-    """Run Celery tasks inside a shared Flask application context."""
+    """Run Celery tasks inside a Flask application context.
+
+    Prefer the current app (e.g. during eager tests) so tasks write to the
+    same database/result store as the caller; fall back to the process-wide
+    app for the real worker.
+    """
 
     abstract = True
 
     def __call__(self, *args, **kwargs):
-        app = get_flask_app()
+        from flask import current_app
+
+        app = current_app._get_current_object() if current_app else get_flask_app()
         with app.app_context():
             return self.run(*args, **kwargs)
 

@@ -14,10 +14,10 @@ A Flask application for computing and exploring the Central Bank of Nigeria's co
 
 Index definitions (indicator labels, pillars, and polarity) live in Python in `app/indices/configs.py`; there is no UI editor for them.
 
-> **Project status:** All feature phases are code-complete, but the app has **not
-> yet been run or tested** — validation, tests, and polish are intentionally
-> deferred to the end. See [`_PLAN.md`](_PLAN.md) for the full plan, current
-> status table, and the *What's left* checklist.
+> **Project status:** Feature-complete and validated. Automated QA (`qa_verify.py`,
+> `smoke_all_indices.py`, and `pytest`) and the manual checklist in
+> [`MANUAL_QA_CHECKLIST.md`](MANUAL_QA_CHECKLIST.md) all pass. See [`_PLAN.md`](_PLAN.md)
+> for the full plan and status table.
 
 ## Structure
 
@@ -88,6 +88,23 @@ alembic upgrade head
 ```
 
 Create new revisions with `alembic revision -m "describe schema change"`, then write and review the `upgrade()` and `downgrade()` operations in the generated file. **Do not use `--autogenerate`**: Alembic autogeneration is deliberately disabled in `migrations/env.py`. Check the current database revision with `alembic current`; inspect pending SQL with `alembic upgrade head --sql` where supported.
+
+## Deployment
+
+For a Linux server with Docker and Nginx, copy [`deploy.sh`](deploy.sh) to the target host and run it as root:
+
+```sh
+chmod +x deploy.sh
+sudo ./deploy.sh
+```
+
+The script installs Docker and Docker Compose if missing, clones (or updates) the project into `/var/www/cbn-composite-indices`, creates a production `.env` from `.env.example`, builds and starts the Compose stack, and configures Nginx as a reverse proxy. Set `DOMAIN` and `EMAIL` to obtain a TLS certificate via Certbot:
+
+```sh
+sudo DOMAIN=cbn-indices.example.com EMAIL=admin@example.com ./deploy.sh
+```
+
+Before deploying, update the `REPO_URL` in `deploy.sh` to point to this repository. After deployment, run the checks in [`MANUAL_QA_CHECKLIST.md`](MANUAL_QA_CHECKLIST.md) to verify the UI, auth, all five indices, exports, and Celery processing.
 
 ## Input data formats
 

@@ -26,6 +26,7 @@ services:
     volumes:
       - uploads:/data/uploads
       - results:/data/results
+      - ../:/reference:ro
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -48,6 +49,7 @@ services:
     volumes:
       - uploads:/data/uploads
       - results:/data/results
+      - ../:/reference:ro
     depends_on:
       migrate:
         condition: service_completed_successfully

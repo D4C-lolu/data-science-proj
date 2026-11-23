@@ -214,8 +214,8 @@ def _cronbach_weighted(z: np.ndarray, weights: np.ndarray, cols, all_cols) -> fl
     k = len(cols)
     if k < 2:
         return float("nan")
-    var_sum = (_weighted_std(subset, weights) ** 2).sum()
-    total_var = _weighted_std(subset.sum(1, keepdims=True), weights)[0] ** 2
+    var_sum = (_weighted_std(subset.T, weights) ** 2).sum()
+    total_var = _weighted_std(subset.sum(1, keepdims=True).T, weights)[0] ** 2
     if total_var == 0:
         return float("nan")
     return k / (k - 1) * (1 - var_sum / total_var)
@@ -224,7 +224,12 @@ def _cronbach_weighted(z: np.ndarray, weights: np.ndarray, cols, all_cols) -> fl
 def _diagnostics(corr: np.ndarray, n_effective: float, p: int):
     try:
         corr_inv = np.linalg.inv(corr)
-        anti = -corr_inv / np.sqrt(np.outer(np.diag(corr_inv), np.diag(corr_inv)))
+        inv_diag = np.diag(corr_inv)
+        # Guard against tiny negative/zero diagonals from near-singular matrices.
+        inv_diag = np.where(inv_diag > 1e-12, inv_diag, 1e-12)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            anti = -corr_inv / np.sqrt(np.outer(inv_diag, inv_diag))
+        anti = np.nan_to_num(anti, nan=0.0, posinf=0.0, neginf=0.0)
         np.fill_diagonal(anti, 0)
         off = corr - np.eye(p)
         msa = (off ** 2).sum(0) / ((off ** 2).sum(0) + (anti ** 2).sum(0))
@@ -377,8 +382,7 @@ def compute_household(config: IndexConfig, data: pd.DataFrame) -> dict:
     polarity = config.polarity
     pillars = config.pillars
 
-    present = [c for c in cols if c in data.columns]
-    missing_mask = pd.to_numeric(data[present], errors="coerce").isna() if present else pd.DataFrame()
+    missing_mask = data.reindex(columns=cols).apply(pd.to_numeric, errors="coerce").isna()
 
     round_col = "round" if "round" in data.columns else None
     weight_col = "w" if "w" in data.columns else None
@@ -458,7 +462,7 @@ def compute_household(config: IndexConfig, data: pd.DataFrame) -> dict:
         "p": int(p),
         "n_effective": _round(n_eff, 1),
         "rounds": [int(r) for r in unique_rounds],
-        "missing_values": int(missing_mask.isna().sum().sum()) if not missing_mask.empty else 0,
+        "missing_values": int(missing_mask.sum().sum()),
         "kmo": _round(kmo, 3),
         "bartlett_chi2": _round(chi2, 1),
         "bartlett_df": int(dof) if dof == dof else None,
