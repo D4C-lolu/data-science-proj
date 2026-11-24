@@ -91,24 +91,21 @@ Create new revisions with `alembic revision -m "describe schema change"`, then w
 
 ## Deployment
 
-For a Linux server with Docker and Nginx, copy [`deploy.sh`](deploy.sh) to the target host and run it as root:
+This host is currently deployed for IP/port access at `http://<server-ip>:8010`, with the app bound to `127.0.0.1:8000` behind Nginx and managed by the `cbn-composite-indices.service` systemd unit. See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full plan, current state, verification commands, and the DNS/TLS TODO.
+
+To deploy or redeploy from the source checkout:
 
 ```sh
-chmod +x deploy.sh
 sudo ./deploy.sh
 ```
 
-The script installs Docker and Docker Compose if missing, clones (or updates) the project into `/var/www/cbn-composite-indices`, creates a production `.env` from `.env.example`, builds and starts the Compose stack, and configures Nginx as a reverse proxy. Set `DOMAIN` and `EMAIL` to obtain a TLS certificate via Certbot:
-
-```sh
-sudo DOMAIN=cbn-indices.example.com EMAIL=admin@example.com ./deploy.sh
-```
-
-Before deploying, update the `REPO_URL` in `deploy.sh` to point to this repository. After deployment, run the checks in [`MANUAL_QA_CHECKLIST.md`](MANUAL_QA_CHECKLIST.md) to verify the UI, auth, all five indices, exports, and Celery processing.
+The script syncs the project into `/var/www/cbn-composite-indices`, creates a production `.env` if needed, builds and starts the Compose stack via systemd, and installs an Nginx reverse proxy on port 8010. It does not touch the existing Nginx sites. After deployment, run the checks in [`MANUAL_QA_CHECKLIST.md`](MANUAL_QA_CHECKLIST.md) to verify the UI, auth, all five indices, exports, and Celery processing.
 
 ## Input data formats
 
 - **Quarterly indices (BCI, CCI, IPI, LMCI)**: a CSV/Excel file with a period column (for example `Quarter`) followed by the index's indicator columns (for example `B1`–`B18` for BCI). An optional reference column (`REF`) enables reference-based weights. Missing values in a series are linearly interpolated for gaps of up to two periods, then rows with any remaining gaps are dropped.
 - **HFCI (household microdata)**: one row per household with the indicator columns (`H1`–`H18`), a `round` column, and a survey design weight column `w`.
+
+On the upload page, use the **Need a starting file?** links to download a header-only CSV or Excel template for any index. Quarterly templates contain the period column, the indicator columns, and an optional `REF` column for reference-based weights. The HFCI template contains `hh_id`, `H1`–`H18`, `round`, and `w`.
 
 The sample datasets and the reference methodology scripts are retained at the project root as reference material.

@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from openpyxl import load_workbook
 
 from app.extensions import db
 from app.indices.calculators import compute
@@ -187,6 +188,51 @@ def test_download_formats(client, fmt):
     assert response.content_length is not None
     if fmt == "xlsx":
         assert response.data[:2] == b"PK"
+
+
+def test_template_download_requires_login(client):
+    response = client.get("/indices/template/BCI?fmt=csv")
+    assert response.status_code == 302
+    assert "/auth/login" in response.headers["Location"]
+
+
+def test_upload_page_offers_template_links(client):
+    _login(client)
+    response = client.get("/indices/upload")
+    assert response.status_code == 200
+    assert b"/indices/template/BCI?fmt=csv" in response.data
+    assert b"/indices/template/BCI?fmt=xlsx" in response.data
+    assert b"Need a starting file?" in response.data
+
+
+@pytest.mark.parametrize("code", list(INDICES))
+def test_csv_template_headers(client, code):
+    _login(client)
+    config = INDICES[code]
+    if config.kind == "household":
+        expected = ["hh_id", *config.columns, "round", "w"]
+    else:
+        expected = [config.period_col, *config.columns, "REF"]
+
+    response = client.get(f"/indices/template/{code}?fmt=csv")
+    assert response.status_code == 200
+    header = response.get_data(as_text=True).splitlines()[0].split(",")
+    assert header == expected
+
+
+def test_excel_template_headers(client):
+    _login(client)
+    response = client.get("/indices/template/LMCI?fmt=xlsx")
+    assert response.status_code == 200
+    workbook = load_workbook(io.BytesIO(response.data), read_only=True)
+    sheet = workbook.active
+    assert [cell.value for cell in sheet[1]] == ["Quarter", *INDICES["LMCI"].columns, "REF"]
+
+
+def test_template_rejects_unknown_index_and_format(client):
+    _login(client)
+    assert client.get("/indices/template/NOPE").status_code == 404
+    assert client.get("/indices/template/BCI?fmt=pdf").status_code == 404
 
 
 def test_calculator_result_contract():

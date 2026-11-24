@@ -7,6 +7,8 @@ import json
 import uuid
 from pathlib import Path
 
+import pandas as pd
+
 from flask import (
     Blueprint,
     abort,
@@ -52,6 +54,41 @@ def _load_result(run: IndexRun) -> dict | None:
         return None
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _template_columns(config):
+    """Header row for an upload template, derived from the index config."""
+    if config.kind == "household":
+        return ["hh_id", *config.columns, "round", "w"]
+    return [config.period_col, *config.columns, "REF"]
+
+
+@indices_bp.get("/template/<code>")
+@login_required
+def download_template(code):
+    """Download a header-only CSV or Excel upload template for one index."""
+    config = INDICES.get(code.strip().upper())
+    if config is None:
+        abort(404)
+
+    fmt = (request.args.get("fmt") or "csv").lower()
+    frame = pd.DataFrame(columns=_template_columns(config))
+    base = f"{config.code.lower()}_upload_template"
+
+    if fmt in {"xlsx", "excel"}:
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            frame.to_excel(writer, index=False, sheet_name="Template")
+        return _send_bytes(
+            buffer.getvalue(),
+            f"{base}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    if fmt == "csv":
+        return _send_bytes(frame.to_csv(index=False).encode("utf-8"), f"{base}.csv", "text/csv")
+
+    abort(404)
 
 
 @indices_bp.get("/")
